@@ -210,6 +210,54 @@ def proposed_initialization_torch_batch(H, theta_d, N, M, K, P_BS, device):
 
     return A0, D0
 
+import torch
+
+def proposed_initialization_torch_batch_multiSNR(H, theta_d, N, M, K, P_BS_list, device):
+    """
+    Proposed initialization using PyTorch (batch version with multi-SNR support)
+
+    Args:
+        H: (batch_size, M, N) complex tensor (channels)
+        theta_d: any design param (unused here, but kept for interface consistency)
+        N, M, K: system dimensions
+        P_BS_list: list or tensor of possible P_BS values (one per SNR)
+        device: torch device
+
+    Returns:
+        A0: (batch_size, N, M) complex tensor (analog precoder)
+        D0: (batch_size, M, N) complex tensor (digital precoder)
+        P_BS_used: (batch_size,) float tensor (which P_BS used for each sample)
+    """
+
+    batch_size = H.shape[0]
+    P_BS_list = torch.as_tensor(P_BS_list, dtype=torch.float32, device=device)
+
+    # === Randomly sample one P_BS per batch sample ===
+    rand_indices = torch.randint(0, len(P_BS_list), (batch_size,), device=device)
+    P_BS_used = P_BS_list[rand_indices]  # (batch_size,)
+
+    # === Compute G, A0 ===
+    G = H.transpose(-1, -2).clone()  # (batch_size, N, M)
+    A0 = torch.exp(-1j * torch.angle(G))[:, :, :M]  # (batch_size, N, M)
+
+    # === Compute pseudo-inverses ===
+    # torch.linalg.pinv supports batched input
+    X_ZF = torch.linalg.pinv(H)              # (batch_size, N, M)
+    A0_pinv = torch.linalg.pinv(A0)          # (batch_size, M, N)
+    D0 = torch.bmm(A0_pinv, X_ZF)            # (batch_size, M, M)
+
+    # === Normalize to satisfy power constraint ===
+    # Compute ||A0 @ D0||_F for each batch
+    norm_factor = torch.linalg.norm(torch.bmm(A0, D0), ord='fro', dim=(1, 2), keepdim=True)  # (batch_size, 1, 1)
+    
+    # Expand P_BS_used to match D0 shape for broadcasting
+    P_BS_expand = torch.sqrt(P_BS_used).view(batch_size, 1, 1)  # (batch_size, 1, 1)
+    
+    D0 = D0 * (P_BS_expand / norm_factor)
+
+    return A0, D0, P_BS_used
+
+
 def random_initialization_torch(N, M, H, P_BS, device):
     """Random initialization using PyTorch"""
     A0 = torch.exp(1j * torch.rand((N, M), device=device) * 2 * np.pi)
