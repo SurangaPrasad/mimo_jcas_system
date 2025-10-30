@@ -181,6 +181,35 @@ def proposed_initialization_torch(H, theta_d, N, M, K, P_BS, device):
     D0 = torch.sqrt(P_BS) * D0 / torch.linalg.norm(A0 @ D0, ord='fro')
     return A0, D0
 
+def proposed_initialization_torch_batch(H, theta_d, N, M, K, P_BS, device):
+    """
+    Proposed initialization using PyTorch (batch version)
+    H: (batch_size, M, N)
+    Returns:
+        A0: (batch_size, N, M)
+        D0: (batch_size, M, N)
+    """
+    batch_size = H.shape[0]
+
+    # G = H^T for each batch (transpose last two dims)
+    G = H.transpose(-1, -2)  # shape: (batch_size, N, M)
+    
+    # A0 = exp(-j * angle(G))[:, :M]
+    A0 = torch.exp(-1j * torch.angle(G))[:, :, :M]  # shape: (batch_size, N, M)
+    
+    # Compute pseudo-inverse for each batch element
+    X_ZF = torch.linalg.pinv(H)  # shape: (batch_size, N, M)
+    
+    # D0 = pinv(A0) @ X_ZF for each batch
+    A0_pinv = torch.linalg.pinv(A0)  # shape: (batch_size, M, N)
+    D0 = torch.bmm(A0_pinv, X_ZF)  # shape: (batch_size, M, M)
+    
+    # Normalize
+    norm_factor = torch.linalg.norm(torch.bmm(A0, D0), ord='fro', dim=(1, 2), keepdim=True)
+    D0 = torch.sqrt(P_BS) * D0 / norm_factor
+
+    return A0, D0
+
 def random_initialization_torch(N, M, H, P_BS, device):
     """Random initialization using PyTorch"""
     A0 = torch.exp(1j * torch.rand((N, M), device=device) * 2 * np.pi)
