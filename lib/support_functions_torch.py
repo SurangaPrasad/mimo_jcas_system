@@ -3,8 +3,7 @@ import matplotlib.pyplot as plt
 from scipy.linalg import svd
 import uuid
 import torch
-
-from lib.dnn import UPGANet
+import h5py
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Wavenumber and antenna spacing
@@ -322,6 +321,9 @@ def evaluate_trained_upganet(N, M, K,  model_path, theta_d_t, sigma_n2_t, omega,
     """
     Evaluate a trained UPGANet model and compute the average achievable rate vs SNR.
     """
+    # Import here to avoid circular import
+    from .dnn import UPGANet
+    
     print("="*70)
     print(f"EVALUATING TRAINED UPGANet (J={J})")
     print("="*70)
