@@ -6,7 +6,7 @@ from .support_functions_torch import compute_rate_torch, compute_tau_torch, grad
 # Projection functions for PyTorch
 def project_unit_modulus(A):
     """Project A onto unit modulus constraint"""
-    return torch.exp(1j * torch.angle(A))
+    return A / (torch.abs(A) + 1e-8)
 
 def project_power_constraint(A, D, P_BS):
     """Project D to satisfy power constraint"""
@@ -23,24 +23,27 @@ class UPGANetLayer(nn.Module):
         self.eta = eta if eta is not None else 1.0 / N
 
         # Learnable step sizes (one for each inner iteration)
-        self.mu = nn.Parameter(torch.full((J,), 0.01, dtype=torch.float32))
+        self.mu = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
         self.lambda_ = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
 
     def forward(self, H, A, D, Psi, sigma_n2, P_BS):
 
         # J inner updates for analog precoder
         A_hat = A.clone()
+        mu = torch.nn.functional.softplus(self.mu)
+        lambda_ = torch.nn.functional.softplus(self.lambda_)
         for j in range(self.J):
+
             # Compute gradients using PyTorch functions
             # DETACH to prevent computing gradients of gradients!
-            with torch.no_grad():
-                grad_RA = gradient_R_A_torch(H, A_hat, D, sigma_n2)
-                grad_tauA = gradient_tau_A_torch(A_hat, D, Psi)
+            # with torch.no_grad():
+            grad_RA = gradient_R_A_torch(H, A_hat, D, sigma_n2)
+            grad_tauA = gradient_tau_A_torch(A_hat, D, Psi)
 
             # Gradient ascent with learnable step size
             # The step sizes (mu) remain in the computational graph for learning
-            A_hat = A_hat + self.mu[j] * (grad_RA - self.omega * grad_tauA)
-            
+            A_hat = A_hat + mu * (grad_RA - self.omega * grad_tauA)
+
             # Unit modulus projection
             A_hat = project_unit_modulus(A_hat)
 
@@ -53,7 +56,7 @@ class UPGANetLayer(nn.Module):
             grad_tauD = gradient_tau_D_torch(A, D, Psi)
 
         # Gradient ascent with learnable step size
-        D = D + self.lambda_ * (grad_RD - self.omega * self.eta * grad_tauD)
+        D = D + lambda_ * (grad_RD - self.omega * self.eta * grad_tauD)
         
         # Power constraint projection
         D = project_power_constraint(A, D, P_BS)
@@ -90,5 +93,7 @@ def upganet_loss(H, A, D, Psi, sigma_n2, omega):
     """
     R = compute_rate_torch(H, A, D, sigma_n2)
     tau = compute_tau_torch(A, D, Psi)
-    return -(R - omega * tau)  # Negative because we minimize loss
+    loss = -(R - omega * tau)
+    loss = loss.mean()
+    return loss 
 

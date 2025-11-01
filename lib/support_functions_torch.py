@@ -147,10 +147,10 @@ def gradient_R_D_torch(H, A, D, sigma_n2, eps=1e-10, clip_value=1e3):
 
         grad_D += xi * (term1 - term2)
 
-    # # Clip gradients to prevent explosion
-    # grad_norm = torch.linalg.norm(grad_D, ord='fro')
-    # if grad_norm > clip_value:
-    #     grad_D = grad_D * (clip_value / grad_norm)
+    # Clip gradients to prevent explosion
+    grad_norm = torch.linalg.norm(grad_D, ord='fro')
+    if grad_norm > clip_value:
+        grad_D = grad_D * (clip_value / grad_norm)
     
     # # Check for NaN/Inf
     # if torch.isnan(grad_D).any() or torch.isinf(grad_D).any():
@@ -158,18 +158,19 @@ def gradient_R_D_torch(H, A, D, sigma_n2, eps=1e-10, clip_value=1e3):
 
     return grad_D
 
-def gradient_tau_A_torch(A, D, Psi):
-    """Compute gradient of tau w.r.t. A using PyTorch with numerical stability"""
+def gradient_tau_A_torch(A, D, Psi, eps=1e-10):
     U = A @ D @ D.conj().T @ A.conj().T
     grad_A = 2 * (U - Psi) @ A @ D @ D.conj().T
+    grad_A = grad_A / (torch.linalg.norm(grad_A, ord='fro') + eps)
     return grad_A
 
-def gradient_tau_D_torch(A, D, Psi, clip_value=1e3):
-    """Compute gradient of tau w.r.t. D using PyTorch with numerical stability"""
+
+def gradient_tau_D_torch(A, D, Psi, eps=1e-10):
     U = A @ D @ D.conj().T @ A.conj().T
     grad_D = 2 * A.conj().T @ (U - Psi) @ A @ D
-    
+    grad_D = grad_D / (torch.linalg.norm(grad_D, ord='fro') + eps)
     return grad_D
+
 
 
 def proposed_initialization_torch(H, theta_d, N, M, K, P_BS, device):
