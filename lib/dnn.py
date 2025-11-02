@@ -39,7 +39,7 @@ class UPGANetLayer(nn.Module):
         self.eta = eta if eta is not None else 1.0 / N
 
         # Learnable step sizes (one for each inner iteration)
-        self.mu = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
+        self.mu = nn.Parameter(torch.full((J,), 0.01, dtype=torch.float32))
         self.lambda_ = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
 
     def forward(self, H, A, D, Psi, sigma_n2, P_BS):
@@ -59,7 +59,7 @@ class UPGANetLayer(nn.Module):
             grad_tauA = gradient_tau_A_torch(A_hat, D, Psi)
 
             # Gradient ascent with learnable step size
-            A_hat = A_hat + mu * (grad_RA - self.omega * grad_tauA)
+            A_hat = A_hat + mu[j] * (grad_RA - self.omega * grad_tauA)
 
             # Unit modulus projection
             A_hat = project_unit_modulus(A_hat)

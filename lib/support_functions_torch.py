@@ -66,91 +66,91 @@ def steering_vector_torch(theta, N, device=device, k_t=k_t , d_t=d_t):
 # Compute communication rate R - PyTorch version with batch support
 def compute_rate_torch(H, A, D, sigma_n2):
     """
-    Compute rate using PyTorch tensors.
-    Supports both single and batched inputs:
-    - Single: H (K, N), A (N, M), D (M, K) -> returns scalar
-    - Batched: H (B, K, N), A (B, N, M), D (B, M, K) -> returns (B,)
+    Vectorized computation of achievable rate (batch or single).
+    - H: (B, K, N) or (K, N)
+    - A: (B, N, M) or (N, M)
+    - D: (B, M, K) or (M, K)
+    - sigma_n2: scalar noise power
+    Returns: (B,) or scalar
     """
-    is_batched = (H.dim() == 3)
-    
-    if is_batched:
-        B, K, N = H.shape
-        R = torch.zeros(B, device=H.device)
-        
-        for k in range(K):
-            # h_k: (B, N, 1)
-            h_k = H[:, k, :].unsqueeze(-1)
-            # d_k: (B, M, 1)
-            d_k = D[:, :, k].unsqueeze(-1)
-            
-            # Signal: |h_k^H @ A @ d_k|^2: (B,)
-            signal = torch.bmm(h_k.conj().transpose(1, 2), torch.bmm(A, d_k))  # (B, 1, 1)
-            num = torch.abs(signal.squeeze(-1).squeeze(-1))**2  # (B,)
-            
-            # Interference from other users
-            denom = sigma_n2
-            for j in range(K):
-                if j != k:
-                    d_j = D[:, :, j].unsqueeze(-1)
-                    interference = torch.bmm(h_k.conj().transpose(1, 2), torch.bmm(A, d_j))
-                    denom = denom + torch.abs(interference.squeeze(-1).squeeze(-1))**2
-            
-            R = R + torch.log2(1 + num / denom)
-        return R
+    # Handle single sample by adding batch dimension
+    if H.dim() == 2:
+        H = H.unsqueeze(0)
+        A = A.unsqueeze(0)
+        D = D.unsqueeze(0)
+        single = True
     else:
-        # Single sample case
-        R = torch.tensor(0.0, device=H.device)
-        K = H.shape[0]
-        
-        for k in range(K):
-            h_k = H[k, :].reshape(-1, 1)
-            d_k = D[:, k].reshape(-1, 1)
-            
-            num = torch.abs(h_k.conj().T @ A @ d_k)**2
-            num = num.squeeze()
-            
-            denom = sigma_n2
-            for j in range(K):
-                if j != k:
-                    interference = torch.abs(h_k.conj().T @ A @ D[:, j].reshape(-1, 1))**2
-                    denom = denom + interference.squeeze()
-            
-            R = R + torch.log2(1 + num / denom)
-        return R
+        single = False
+
+    # (B, K, N) @ (B, N, M) -> (B, K, M)
+    H_eff = torch.bmm(H, A)
+
+    # (B, K, M) @ (B, M, K) -> (B, K, K)
+    G = torch.bmm(H_eff, D)
+
+    # Power coupling matrix (B, K, K)
+    P = torch.abs(G) ** 2
+
+    # Desired signal (diagonal)
+    signal = torch.diagonal(P, dim1=-2, dim2=-1)
+
+    # Total received power per user
+    total_power = P.sum(dim=-1)
+
+    # Interference = total - desired
+    interference = total_power - signal + sigma_n2
+
+    rate = torch.log2(1 + signal / interference).sum(dim=-1)
+
+    return rate.squeeze(0) if single else rate
 
 
-# Compute sensing error tau - PyTorch version with batch support
+
 def compute_tau_torch(A, D, Psi):
     """
-    Compute sensing error using PyTorch.
-    Supports both single and batched inputs:
-    - Single: A (N, M), D (M, K), Psi (M, M) -> returns scalar
-    - Batched: A (B, N, M), D (B, M, K), Psi (B, M, M) -> returns (B,)
-    """
-    is_batched = (A.dim() == 3)
+    Compute sensing error τ = || A D Dᴴ Aᴴ - Ψ ||_F²
+    Fully vectorized for both single and batched inputs.
     
-    if is_batched:
-        B = A.shape[0]
-        # U = A @ D @ D^H @ A^H: (B, N, N)
-        DD = torch.bmm(D, D.conj().transpose(1, 2))  # (B, M, M)
-        ADD = torch.bmm(A, DD)  # (B, N, M)
-        U = torch.bmm(ADD, A.conj().transpose(1, 2))  # (B, N, N)
-        
-        # Handle Psi shape
-        if Psi.dim() == 2:
-            # Single Psi, broadcast to all batches
-            Psi_expanded = Psi.unsqueeze(0).expand(B, -1, -1)
-        else:
-            Psi_expanded = Psi
-        
-        # Compute Frobenius norm per batch
-        diff = U - Psi_expanded
-        tau = torch.linalg.norm(diff, ord='fro', dim=(1, 2))**2  # (B,)
-        return tau
+    Parameters
+    ----------
+    A : (N, M) or (B, N, M)
+    D : (M, K) or (B, M, K)
+    Psi : (M, M) or (B, M, M)
+    
+    Returns
+    -------
+    tau : scalar or (B,)
+    """
+    # --- Ensure all are at least 3D for uniform math ---
+    if A.dim() == 2:
+        A = A.unsqueeze(0)
+        D = D.unsqueeze(0)
+        Psi = Psi.unsqueeze(0)
+        squeeze_output = True
     else:
-        # Single sample case
-        tau = torch.linalg.norm(A @ D @ D.conj().T @ A.conj().T - Psi, ord='fro')**2
-        return tau
+        squeeze_output = False
+
+    # Compute U = A D Dᴴ Aᴴ   → (B, N, N)
+    # Step 1: D Dᴴ
+    DDH = torch.bmm(D, D.conj().transpose(1, 2))     # (B, M, M)
+    # Step 2: A (D Dᴴ)
+    ADDH = torch.bmm(A, DDH)                         # (B, N, M)
+    # Step 3: (A D Dᴴ) Aᴴ
+    U = torch.bmm(ADDH, A.conj().transpose(1, 2))    # (B, N, N)
+
+    # If Psi is same for all batches → broadcast
+    if Psi.shape[0] != A.shape[0]:
+        Psi = Psi.expand(A.shape[0], -1, -1)
+
+    # --- τ = ||U - Ψ||_F² per batch ---
+    diff = U - Psi
+    tau = torch.sum(torch.abs(diff)**2, dim=(1, 2))  # (B,)
+
+    # Return scalar if single sample
+    if squeeze_output:
+        tau = tau.squeeze(0)
+    return tau
+
 
 
 # Gradients - PyTorch versions with full batch support
