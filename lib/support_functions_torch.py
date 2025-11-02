@@ -63,112 +63,308 @@ def steering_vector_torch(theta, N, device=device, k_t=k_t , d_t=d_t):
     phase = 1j * k_t * d_t * torch.arange(N, dtype=torch.float32, device=device) * torch.sin(torch.tensor(theta, device=device))
     return torch.exp(phase) / torch.sqrt(torch.tensor(N, dtype=torch.float32, device=device))
 
-# Compute communication rate R - PyTorch version (FIXED)
+# Compute communication rate R - PyTorch version with batch support
 def compute_rate_torch(H, A, D, sigma_n2):
-    """Compute rate using PyTorch tensors - Fixed version"""
-    R = torch.tensor(0.0, device=device)
-    K = H.shape[0]
+    """
+    Compute rate using PyTorch tensors.
+    Supports both single and batched inputs:
+    - Single: H (K, N), A (N, M), D (M, K) -> returns scalar
+    - Batched: H (B, K, N), A (B, N, M), D (B, M, K) -> returns (B,)
+    """
+    is_batched = (H.dim() == 3)
     
-    for k in range(K):
-        h_k = H[k, :].reshape(-1, 1)  # (N x 1)
-        d_k = D[:, k].reshape(-1, 1)  # (M x 1)
-
-        # Use .item() to extract scalar values and avoid shape issues
-        num = torch.abs(h_k.conj().T @ A @ d_k)**2
-        num = num.squeeze()  # Remove all dimensions of size 1
+    if is_batched:
+        B, K, N = H.shape
+        R = torch.zeros(B, device=H.device)
         
-        denom = sigma_n2
-        for j in range(K):
-            if j != k:
-                interference = torch.abs(h_k.conj().T @ A @ D[:, j].reshape(-1, 1))**2
-                denom = denom + interference.squeeze()
+        for k in range(K):
+            # h_k: (B, N, 1)
+            h_k = H[:, k, :].unsqueeze(-1)
+            # d_k: (B, M, 1)
+            d_k = D[:, :, k].unsqueeze(-1)
+            
+            # Signal: |h_k^H @ A @ d_k|^2: (B,)
+            signal = torch.bmm(h_k.conj().transpose(1, 2), torch.bmm(A, d_k))  # (B, 1, 1)
+            num = torch.abs(signal.squeeze(-1).squeeze(-1))**2  # (B,)
+            
+            # Interference from other users
+            denom = sigma_n2
+            for j in range(K):
+                if j != k:
+                    d_j = D[:, :, j].unsqueeze(-1)
+                    interference = torch.bmm(h_k.conj().transpose(1, 2), torch.bmm(A, d_j))
+                    denom = denom + torch.abs(interference.squeeze(-1).squeeze(-1))**2
+            
+            R = R + torch.log2(1 + num / denom)
+        return R
+    else:
+        # Single sample case
+        R = torch.tensor(0.0, device=H.device)
+        K = H.shape[0]
         
-    
-        R = R +  torch.log2(1 + num / denom)
-    return R
+        for k in range(K):
+            h_k = H[k, :].reshape(-1, 1)
+            d_k = D[:, k].reshape(-1, 1)
+            
+            num = torch.abs(h_k.conj().T @ A @ d_k)**2
+            num = num.squeeze()
+            
+            denom = sigma_n2
+            for j in range(K):
+                if j != k:
+                    interference = torch.abs(h_k.conj().T @ A @ D[:, j].reshape(-1, 1))**2
+                    denom = denom + interference.squeeze()
+            
+            R = R + torch.log2(1 + num / denom)
+        return R
 
-# Compute sensing error tau - PyTorch version
+
+# Compute sensing error tau - PyTorch version with batch support
 def compute_tau_torch(A, D, Psi):
-    """Compute sensing error using PyTorch"""
-    tau = torch.linalg.norm(A @ D @ D.conj().T @ A.conj().T - Psi, ord='fro')**2
-    return tau
+    """
+    Compute sensing error using PyTorch.
+    Supports both single and batched inputs:
+    - Single: A (N, M), D (M, K), Psi (M, M) -> returns scalar
+    - Batched: A (B, N, M), D (B, M, K), Psi (B, M, M) -> returns (B,)
+    """
+    is_batched = (A.dim() == 3)
+    
+    if is_batched:
+        B = A.shape[0]
+        # U = A @ D @ D^H @ A^H: (B, N, N)
+        DD = torch.bmm(D, D.conj().transpose(1, 2))  # (B, M, M)
+        ADD = torch.bmm(A, DD)  # (B, N, M)
+        U = torch.bmm(ADD, A.conj().transpose(1, 2))  # (B, N, N)
+        
+        # Handle Psi shape
+        if Psi.dim() == 2:
+            # Single Psi, broadcast to all batches
+            Psi_expanded = Psi.unsqueeze(0).expand(B, -1, -1)
+        else:
+            Psi_expanded = Psi
+        
+        # Compute Frobenius norm per batch
+        diff = U - Psi_expanded
+        tau = torch.linalg.norm(diff, ord='fro', dim=(1, 2))**2  # (B,)
+        return tau
+    else:
+        # Single sample case
+        tau = torch.linalg.norm(A @ D @ D.conj().T @ A.conj().T - Psi, ord='fro')**2
+        return tau
 
 
-# Gradients - PyTorch versions with numerical stability
-def gradient_R_A_torch(H, A, D, eps=1e-10, sigma_n2=1):
-    """Compute gradient of R w.r.t. A using PyTorch with numerical stability"""
-    xi = 1 / torch.log(torch.tensor(2.0, device=device))
-    grad_A = torch.zeros_like(A, dtype=torch.cfloat)
-    K = H.shape[0]
-
-    V = D @ D.conj().T
-
-    for k in range(K):
-        h_k = H[k, :].reshape(-1, 1)
-        H_tilde_k = h_k @ h_k.conj().T
-
-        D_bar_k = D.clone()
-        D_bar_k[:, k] = 0.0
-
-        V_bar_k = D_bar_k @ D_bar_k.conj().T
-
-        # Add epsilon for numerical stability
-        denom1 = torch.trace(A @ V @ A.conj().T @ H_tilde_k) + sigma_n2 + eps
-        denom2 = torch.trace(A @ V_bar_k @ A.conj().T @ H_tilde_k) + sigma_n2 + eps
-
-        term1 = H_tilde_k @ A @ V / denom1
-        term2 = H_tilde_k @ A @ V_bar_k / denom2
-
-        grad_A += xi * (term1 - term2)
+# Gradients - PyTorch versions with full batch support
+def gradient_R_A_torch(H, A, D, sigma_n2=1, eps=1e-10):
+    """
+    Compute gradient of R w.r.t. A using PyTorch with numerical stability.
+    Supports both single and batched inputs:
+    - Single: H (K, N), A (N, M), D (M, K)
+    - Batched: H (B, K, N), A (B, N, M), D (B, M, K)
+    """
+    xi = 1 / torch.log(torch.tensor(2.0, device=A.device))
+    
+    # Check if batched
+    is_batched = (A.dim() == 3)
+    
+    if is_batched:
+        B, N, M = A.shape
+        K = D.shape[-1]
+        grad_A = torch.zeros_like(A, dtype=torch.cfloat)
+        
+        # V = D @ D^H for each batch: (B, M, M)
+        V = torch.bmm(D, D.conj().transpose(1, 2))
+        
+        for k in range(K):
+            # h_k: (B, N, 1)
+            h_k = H[:, k, :].unsqueeze(-1)
+            # H_tilde_k: (B, N, N)
+            H_tilde_k = torch.bmm(h_k, h_k.conj().transpose(1, 2))
+            
+            # D_bar_k: D with k-th column zeroed
+            D_bar_k = D.clone()
+            D_bar_k[:, :, k] = 0.0
+            V_bar_k = torch.bmm(D_bar_k, D_bar_k.conj().transpose(1, 2))
+            
+            # Compute denominators using batch trace
+            # trace(A @ V @ A^H @ H_tilde_k) for each batch
+            AV = torch.bmm(A, V)  # (B, N, M)
+            AVA = torch.bmm(AV, A.conj().transpose(1, 2))  # (B, N, N)
+            AVAH = torch.bmm(AVA, H_tilde_k)  # (B, N, N)
+            denom1 = torch.diagonal(AVAH, dim1=-2, dim2=-1).sum(dim=-1) + sigma_n2 + eps  # (B,)
+            
+            AV_bar = torch.bmm(A, V_bar_k)
+            AVA_bar = torch.bmm(AV_bar, A.conj().transpose(1, 2))
+            AVAH_bar = torch.bmm(AVA_bar, H_tilde_k)
+            denom2 = torch.diagonal(AVAH_bar, dim1=-2, dim2=-1).sum(dim=-1) + sigma_n2 + eps  # (B,)
+            
+            # Compute terms: (B, N, M)
+            term1 = torch.bmm(H_tilde_k, torch.bmm(A, V)) / denom1.view(B, 1, 1)
+            term2 = torch.bmm(H_tilde_k, torch.bmm(A, V_bar_k)) / denom2.view(B, 1, 1)
+            
+            grad_A += xi * (term1 - term2)
+    else:
+        # Single sample case
+        K = H.shape[0]
+        grad_A = torch.zeros_like(A, dtype=torch.cfloat)
+        V = D @ D.conj().T
+        
+        for k in range(K):
+            h_k = H[k, :].reshape(-1, 1)
+            H_tilde_k = h_k @ h_k.conj().T
+            
+            D_bar_k = D.clone()
+            D_bar_k[:, k] = 0.0
+            V_bar_k = D_bar_k @ D_bar_k.conj().T
+            
+            denom1 = torch.trace(A @ V @ A.conj().T @ H_tilde_k) + sigma_n2 + eps
+            denom2 = torch.trace(A @ V_bar_k @ A.conj().T @ H_tilde_k) + sigma_n2 + eps
+            
+            term1 = H_tilde_k @ A @ V / denom1
+            term2 = H_tilde_k @ A @ V_bar_k / denom2
+            
+            grad_A += xi * (term1 - term2)
     
     return grad_A
 
 
 def gradient_R_D_torch(H, A, D, sigma_n2, eps=1e-10, clip_value=1e3):
-    """Compute gradient of R w.r.t. D using PyTorch with numerical stability"""
-    xi = 1 / torch.log(torch.tensor(2.0, device=device))
-    grad_D = torch.zeros_like(D, dtype=torch.cfloat)
-    K = H.shape[0]
-
-    for k in range(K):
-        h_k = H[k, :].reshape(-1, 1)
-        H_tilde_k = h_k @ h_k.conj().T
-        H_bar_k = A.conj().T @ H_tilde_k @ A
-
-        D_bar_k = D.clone()
-        D_bar_k[:, k] = 0.0
-
-        # Add epsilon for numerical stability
-        denom1 = torch.trace(D @ D.conj().T @ H_bar_k) + sigma_n2 + eps
-        denom2 = torch.trace(D_bar_k @ D_bar_k.conj().T @ H_bar_k) + sigma_n2 + eps
-
-        term1 = (H_bar_k @ D) / denom1
-        term2 = (H_bar_k @ D_bar_k) / denom2
-
-        grad_D += xi * (term1 - term2)
-
-    # Clip gradients to prevent explosion
-    grad_norm = torch.linalg.norm(grad_D, ord='fro')
-    if grad_norm > clip_value:
-        grad_D = grad_D * (clip_value / grad_norm)
+    """
+    Compute gradient of R w.r.t. D using PyTorch with numerical stability.
+    Supports both single and batched inputs:
+    - Single: H (K, N), A (N, M), D (M, K)
+    - Batched: H (B, K, N), A (B, N, M), D (B, M, K)
+    """
+    xi = 1 / torch.log(torch.tensor(2.0, device=D.device))
     
-    # # Check for NaN/Inf
-    # if torch.isnan(grad_D).any() or torch.isinf(grad_D).any():
-    #     return torch.zeros_like(D, dtype=torch.cfloat)
-
+    # Check if batched
+    is_batched = (D.dim() == 3)
+    
+    if is_batched:
+        B, M, K = D.shape
+        grad_D = torch.zeros_like(D, dtype=torch.cfloat)
+        
+        for k in range(K):
+            # h_k: (B, N, 1)
+            h_k = H[:, k, :].unsqueeze(-1)
+            # H_tilde_k: (B, N, N)
+            H_tilde_k = torch.bmm(h_k, h_k.conj().transpose(1, 2))
+            
+            # H_bar_k = A^H @ H_tilde_k @ A: (B, M, M)
+            H_bar_k = torch.bmm(torch.bmm(A.conj().transpose(1, 2), H_tilde_k), A)
+            
+            # D_bar_k: D with k-th column zeroed
+            D_bar_k = D.clone()
+            D_bar_k[:, :, k] = 0.0
+            
+            # Compute denominators using batch trace
+            DD = torch.bmm(D, D.conj().transpose(1, 2))  # (B, M, M)
+            DDH = torch.bmm(DD, H_bar_k)  # (B, M, M)
+            denom1 = torch.diagonal(DDH, dim1=-2, dim2=-1).sum(dim=-1) + sigma_n2 + eps  # (B,)
+            
+            DD_bar = torch.bmm(D_bar_k, D_bar_k.conj().transpose(1, 2))
+            DDH_bar = torch.bmm(DD_bar, H_bar_k)
+            denom2 = torch.diagonal(DDH_bar, dim1=-2, dim2=-1).sum(dim=-1) + sigma_n2 + eps  # (B,)
+            
+            # Compute terms: (B, M, K)
+            term1 = torch.bmm(H_bar_k, D) / denom1.view(B, 1, 1)
+            term2 = torch.bmm(H_bar_k, D_bar_k) / denom2.view(B, 1, 1)
+            
+            grad_D += xi * (term1 - term2)
+        
+        # Clip gradients per batch
+        grad_norms = torch.linalg.norm(grad_D, ord='fro', dim=(1, 2))  # (B,)
+        scale = torch.minimum(torch.ones_like(grad_norms), clip_value / (grad_norms + eps))
+        grad_D = grad_D * scale.view(B, 1, 1)
+    else:
+        # Single sample case
+        K = H.shape[0]
+        grad_D = torch.zeros_like(D, dtype=torch.cfloat)
+        
+        for k in range(K):
+            h_k = H[k, :].reshape(-1, 1)
+            H_tilde_k = h_k @ h_k.conj().T
+            H_bar_k = A.conj().T @ H_tilde_k @ A
+            
+            D_bar_k = D.clone()
+            D_bar_k[:, k] = 0.0
+            
+            denom1 = torch.trace(D @ D.conj().T @ H_bar_k) + sigma_n2 + eps
+            denom2 = torch.trace(D_bar_k @ D_bar_k.conj().T @ H_bar_k) + sigma_n2 + eps
+            
+            term1 = (H_bar_k @ D) / denom1
+            term2 = (H_bar_k @ D_bar_k) / denom2
+            
+            grad_D += xi * (term1 - term2)
+        
+        # Clip gradients
+        grad_norm = torch.linalg.norm(grad_D, ord='fro')
+        if grad_norm > clip_value:
+            grad_D = grad_D * (clip_value / grad_norm)
+    
     return grad_D
 
+
 def gradient_tau_A_torch(A, D, Psi, eps=1e-10):
-    U = A @ D @ D.conj().T @ A.conj().T
-    grad_A = 2 * (U - Psi) @ A @ D @ D.conj().T
-    grad_A = grad_A / (torch.linalg.norm(grad_A, ord='fro') + eps)
+    """
+    Compute gradient of tau w.r.t. A.
+    Supports both single and batched inputs:
+    - Single: A (N, M), D (M, K), Psi (M, M)
+    - Batched: A (B, N, M), D (B, M, K), Psi (B, M, M)
+    """
+    is_batched = (A.dim() == 3)
+    
+    if is_batched:
+        B = A.shape[0]
+        # U = A @ D @ D^H @ A^H: (B, N, N)
+        DD = torch.bmm(D, D.conj().transpose(1, 2))  # (B, M, M)
+        ADD = torch.bmm(A, DD)  # (B, N, M)
+        U = torch.bmm(ADD, A.conj().transpose(1, 2))  # (B, N, N)
+        
+        # grad_A = 2 * (U - Psi) @ A @ D @ D^H: (B, N, M)
+        U_minus_Psi = U - Psi.view(B, -1, Psi.shape[-1]) if Psi.dim() == 2 else U - Psi
+        grad_A = 2 * torch.bmm(torch.bmm(U_minus_Psi, A), DD)
+        
+        # Normalize per batch
+        grad_norms = torch.linalg.norm(grad_A, ord='fro', dim=(1, 2), keepdim=True)  # (B, 1, 1)
+        grad_A = grad_A / (grad_norms + eps)
+    else:
+        # Single sample case
+        U = A @ D @ D.conj().T @ A.conj().T
+        grad_A = 2 * (U - Psi) @ A @ D @ D.conj().T
+        grad_A = grad_A / (torch.linalg.norm(grad_A, ord='fro') + eps)
+    
     return grad_A
 
 
 def gradient_tau_D_torch(A, D, Psi, eps=1e-10):
-    U = A @ D @ D.conj().T @ A.conj().T
-    grad_D = 2 * A.conj().T @ (U - Psi) @ A @ D
-    grad_D = grad_D / (torch.linalg.norm(grad_D, ord='fro') + eps)
+    """
+    Compute gradient of tau w.r.t. D.
+    Supports both single and batched inputs:
+    - Single: A (N, M), D (M, K), Psi (M, M)
+    - Batched: A (B, N, M), D (B, M, K), Psi (B, M, M)
+    """
+    is_batched = (D.dim() == 3)
+    
+    if is_batched:
+        B = D.shape[0]
+        # U = A @ D @ D^H @ A^H: (B, N, N)
+        DD = torch.bmm(D, D.conj().transpose(1, 2))  # (B, M, M)
+        ADD = torch.bmm(A, DD)  # (B, N, M)
+        U = torch.bmm(ADD, A.conj().transpose(1, 2))  # (B, N, N)
+        
+        # grad_D = 2 * A^H @ (U - Psi) @ A @ D: (B, M, K)
+        U_minus_Psi = U - Psi.view(B, -1, Psi.shape[-1]) if Psi.dim() == 2 else U - Psi
+        grad_D = 2 * torch.bmm(torch.bmm(A.conj().transpose(1, 2), U_minus_Psi), torch.bmm(A, D))
+        
+        # Normalize per batch
+        grad_norms = torch.linalg.norm(grad_D, ord='fro', dim=(1, 2), keepdim=True)  # (B, 1, 1)
+        grad_D = grad_D / (grad_norms + eps)
+    else:
+        # Single sample case
+        U = A @ D @ D.conj().T @ A.conj().T
+        grad_D = 2 * A.conj().T @ (U - Psi) @ A @ D
+        grad_D = grad_D / (torch.linalg.norm(grad_D, ord='fro') + eps)
+    
     return grad_D
 
 
