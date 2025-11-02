@@ -9,9 +9,25 @@ def project_unit_modulus(A):
     return A / (torch.abs(A) + 1e-8)
 
 def project_power_constraint(A, D, P_BS):
-    """Project D to satisfy power constraint"""
-    norm_factor = torch.sqrt(P_BS) / torch.linalg.norm(A @ D, ord='fro')
-    return D * norm_factor
+    """
+    A: (B, N, M) or (N, M) if single sample
+    D: (B, M, K) or (M, K)
+    P_BS: (B,) or scalar
+    Returns scaled D, same device/dtype.
+    """
+    if A.dim() == 2:
+        # single sample
+        norm = torch.linalg.norm(A @ D, ord='fro')
+        return D * (torch.sqrt(P_BS) / (norm + 1e-8))
+    else:
+        # batched
+        # compute A @ D for each sample: (B, N, K)
+        AD = torch.bmm(A, D)                    # (B, N, K)
+        norms = torch.linalg.norm(AD, dim=(1,2))  # (B,)
+        scale = torch.sqrt(P_BS).view(-1).to(norms.device) / (norms + 1e-8)  # (B,)
+        scale = scale.view(-1, 1, 1)            # (B,1,1)
+        return D * scale
+
 
 class UPGANetLayer(nn.Module):
     """Single layer of UPGANet with learnable step sizes"""
@@ -65,35 +81,64 @@ class UPGANetLayer(nn.Module):
 
 
 class UPGANet(nn.Module):
-    """Unfolded Projected Gradient Ascent Network"""
     def __init__(self, N, M, K, omega, I_max=120, J=10):
-        super(UPGANet, self).__init__()
-        self.N = N
-        self.M = M
-        self.K = K
-        self.omega = omega
-        self.I_max = I_max
-        
-        # Create I_max layers (outer iterations)
-        self.layers = nn.ModuleList([
-            UPGANetLayer(N, M, K, omega, J=J) for _ in range(I_max)
-        ])
-    
-    def forward(self, H, A0, D0, Psi, sigma_n2, P_BS):
+        super().__init__()
+        self.N = N; self.M = M; self.K = K; self.omega = omega; self.I_max = I_max
+        self.layers = nn.ModuleList([UPGANetLayer(N, M, K, omega, J=J) for _ in range(I_max)])
 
-        A, D = A0, D0
+    def forward(self, H, A0, D0, Psi, sigma_n2, P_BS):
+        """
+        Support both single-sample and batched inputs.
+        Expected shapes (batched):
+            H:       (B, K, N) or (B, K, N, M) depending on your H shape convention
+            A0:      (B, N, M)
+            D0:      (B, M, K)
+            Psi:     (B, M, M)
+            P_BS:    (B,)
+        For single-sample, shapes without leading batch dim are accepted too.
+        """
+        # Detect batched vs single
+        batched = (A0.dim() == 3)  # (B, N, M) -> batched
+        if not batched:
+            A, D = A0, D0
+            for i in range(self.I_max):
+                A, D = self.layers[i](H, A, D, Psi, sigma_n2, P_BS)
+            return A, D
+
+        # Batched path
+        B = A0.shape[0]
+        A = A0
+        D = D0
+
         for i in range(self.I_max):
-            A, D = self.layers[i](H, A, D, Psi, sigma_n2, P_BS)
+            A_list = []
+            D_list = []
+            for b in range(B):
+                # call per-sample layer (H[b] shape must match layer expectation)
+                A_b, D_b = self.layers[i](H[b], A[b], D[b], Psi[b], sigma_n2, P_BS[b])
+                A_list.append(A_b)
+                D_list.append(D_b)
+            A = torch.stack(A_list, dim=0)
+            D = torch.stack(D_list, dim=0)
+
         return A, D
 
+
 def upganet_loss(H, A, D, Psi, sigma_n2, omega):
-    """
-    Compute loss for UPGANet training
-    Loss = -(R - ω·τ) where we want to maximize (R - ω·τ)
-    """
-    R = compute_rate_torch(H, A, D, sigma_n2)
-    tau = compute_tau_torch(A, D, Psi)
-    loss = -(R - omega * tau)
-    loss = loss.mean()
-    return loss 
+    # H, A, D, Psi may be batched
+    if A.dim() == 3:  # batched
+        B = A.shape[0]
+        losses = []
+        for b in range(B):
+            R = compute_rate_torch(H[b], A[b], D[b], sigma_n2)
+            tau = compute_tau_torch(A[b], D[b], Psi[b])
+            losses.append(-(R - omega * tau))
+        loss = torch.stack([l if isinstance(l, torch.Tensor) else torch.tensor(l, device=A.device) for l in losses]).mean()
+    else:
+        R = compute_rate_torch(H, A, D, sigma_n2)
+        tau = compute_tau_torch(A, D, Psi)
+        loss = -(R - omega * tau)
+        loss = loss.mean() if isinstance(loss, torch.Tensor) else torch.tensor(loss, device=A.device)
+    return loss
+
 
