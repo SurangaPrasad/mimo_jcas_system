@@ -108,24 +108,10 @@ def upganet_loss(H, A, D, Psi, sigma_n2, omega):
     """
     Compute loss for UPGANet training
     Loss = -(R - ω·τ) where we want to maximize (R - ω·τ)
-    Supports both single and batched inputs
     """
-    # Compute R and tau (functions now support batching)
     R = compute_rate_torch(H, A, D, sigma_n2)
     tau = compute_tau_torch(A, D, Psi)
-    
-    # Compute objective
-    objective = R - omega * tau
-    
-    # Return negative (since we minimize loss)
-    if isinstance(objective, torch.Tensor):
-        if objective.dim() == 0:
-            # Scalar
-            return -objective
-        else:
-            # Batched - return mean
-            return -objective.mean()
-    else:
-        return -torch.tensor(objective, device=A.device)
-
+    loss = -(R - omega * tau)
+    loss = loss.mean()
+    return loss 
 

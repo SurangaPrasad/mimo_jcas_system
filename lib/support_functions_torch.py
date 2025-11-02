@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy import signal
 from scipy.linalg import svd
 import uuid
 import torch
@@ -100,10 +101,11 @@ def compute_rate_torch(H, A, D, sigma_n2):
     # Interference = total - desired
     interference = total_power - signal + sigma_n2
 
-    rate = torch.log2(1 + signal / interference).sum(dim=-1)
+    eps = 1e-10
+    rate = torch.log2(1 + signal / (interference + eps)).sum(dim=-1)
+
 
     return rate.squeeze(0) if single else rate
-
 
 
 def compute_tau_torch(A, D, Psi):
@@ -114,42 +116,46 @@ def compute_tau_torch(A, D, Psi):
     Parameters
     ----------
     A : (N, M) or (B, N, M)
+        Analog precoder.
     D : (M, K) or (B, M, K)
-    Psi : (M, M) or (B, M, M)
-    
+        Digital precoder.
+    Psi : (N, N) or (B, N, N)
+        Benchmark beampattern covariance matrix.
+
     Returns
     -------
     tau : scalar or (B,)
+        Frobenius-norm squared sensing mismatch.
     """
-    # --- Ensure all are at least 3D for uniform math ---
+    # Ensure 3D for uniform operations
     if A.dim() == 2:
-        A = A.unsqueeze(0)
-        D = D.unsqueeze(0)
-        Psi = Psi.unsqueeze(0)
-        squeeze_output = True
+        A = A.unsqueeze(0)      # (1, N, M)
+        D = D.unsqueeze(0)      # (1, M, K)
+        Psi = Psi.unsqueeze(0)  # (1, N, N)
+        single = True
     else:
-        squeeze_output = False
+        single = False
 
-    # Compute U = A D Dᴴ Aᴴ   → (B, N, N)
-    # Step 1: D Dᴴ
-    DDH = torch.bmm(D, D.conj().transpose(1, 2))     # (B, M, M)
-    # Step 2: A (D Dᴴ)
-    ADDH = torch.bmm(A, DDH)                         # (B, N, M)
-    # Step 3: (A D Dᴴ) Aᴴ
-    U = torch.bmm(ADDH, A.conj().transpose(1, 2))    # (B, N, N)
+    B = A.shape[0]
 
-    # If Psi is same for all batches → broadcast
-    if Psi.shape[0] != A.shape[0]:
-        Psi = Psi.expand(A.shape[0], -1, -1)
+    # 1. D Dᴴ : (B, M, M)
+    DDH = torch.bmm(D, D.conj().transpose(1, 2))
 
-    # --- τ = ||U - Ψ||_F² per batch ---
+    # 2. A (D Dᴴ) : (B, N, M)
+    ADDH = torch.bmm(A, DDH)
+
+    # 3. (A D Dᴴ) Aᴴ : (B, N, N)
+    U = torch.bmm(ADDH, A.conj().transpose(1, 2))
+
+    # Broadcast Ψ if same across batch
+    if Psi.shape[0] != B:
+        Psi = Psi.expand(B, -1, -1)
+
+    # 4. τ = ||U - Ψ||_F² per batch
     diff = U - Psi
     tau = torch.sum(torch.abs(diff)**2, dim=(1, 2))  # (B,)
 
-    # Return scalar if single sample
-    if squeeze_output:
-        tau = tau.squeeze(0)
-    return tau
+    return tau.squeeze(0) if single else tau
 
 
 
@@ -406,8 +412,6 @@ def proposed_initialization_torch_batch(H, theta_d, N, M, K, P_BS, device):
     D0 = torch.sqrt(P_BS) * D0 / norm_factor
 
     return A0, D0
-
-import torch
 
 def proposed_initialization_torch_batch_multiSNR(H, theta_d, N, M, K, P_BS_list, device):
     """
