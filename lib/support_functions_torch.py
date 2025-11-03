@@ -64,46 +64,57 @@ def steering_vector_torch(theta, N, device=device, k_t=k_t , d_t=d_t):
     phase = 1j * k_t * d_t * torch.arange(N, dtype=torch.float32, device=device) * torch.sin(torch.tensor(theta, device=device))
     return torch.exp(phase) / torch.sqrt(torch.tensor(N, dtype=torch.float32, device=device))
 
-# Compute communication rate R - PyTorch version with batch support
 def compute_rate_torch(H, A, D, sigma_n2):
     """
     Vectorized computation of achievable rate (batch or single).
     - H: (B, K, N) or (K, N)
     - A: (B, N, M) or (N, M)
     - D: (B, M, K) or (M, K)
-    - sigma_n2: scalar noise power
+    - sigma_n2: scalar noise power (real)
     Returns: (B,) or scalar
     """
-    # Handle single sample by adding batch dimension
-    if H.dim() == 2:
-        H = H.unsqueeze(0)
-        A = A.unsqueeze(0)
-        D = D.unsqueeze(0)
-        single = True
-    else:
-        single = False
-
-    # (B, K, N) @ (B, N, M) -> (B, K, M)
-    H_eff = torch.bmm(H, A)
-
-    # (B, K, M) @ (B, M, K) -> (B, K, K)
-    G = torch.bmm(H_eff, D)
-
-    # Power coupling matrix (B, K, K)
-    P = torch.abs(G) ** 2
-
-    # Desired signal (diagonal)
-    signal = torch.diagonal(P, dim1=-2, dim2=-1)
-
-    # Total received power per user
-    total_power = P.sum(dim=-1)
-
-    # Interference = total - desired
-    interference = total_power - signal + sigma_n2
-
     eps = 1e-10
-    rate = torch.log2(1 + signal / (interference + eps)).sum(dim=-1)
 
+    # single-sample -> make batch dimension
+    single = False
+    if H.dim() == 2:
+        single = True
+        H = H.unsqueeze(0)    # (1, K, N)
+        A = A.unsqueeze(0)    # (1, N, M)
+        D = D.unsqueeze(0)    # (1, M, K)
+
+    # Now H: (B, K, N), A: (B, N, M), D: (B, M, K)
+    B, K, N = H.shape
+    # Effective row: h_k^H A  -> compute using H.conj() @ A
+    # H.conj() has shape (B, K, N), A is (B, N, M) => bmm -> (B, K, M)
+    H_eff = torch.bmm(H.conj(), A)   # (B, K, M) where row k is h_k^H A
+
+    # Now compute G_{k,j} = (h_k^H A) @ d_j  -> H_eff (B,K,M) @ D (B,M,K) -> (B, K, K)
+    G = torch.bmm(H_eff, D)          # (B, K, K) complex
+    P = torch.abs(G) ** 2            # (B, K, K) real: power coupling matrix
+
+    # desired signal is diagonal
+    signal = torch.diagonal(P, dim1=-2, dim2=-1)   # (B, K)
+
+    # total received power per user
+    total_power = P.sum(dim=-1)      # (B, K)
+
+    # interference = total - desired
+    interference = total_power - signal
+
+    # add noise power to denom (broadcast sigma_n2)
+    # ensure sigma_n2 is a tensor on same device
+    if not torch.is_tensor(sigma_n2):
+        sigma_n2_t = torch.tensor(sigma_n2, dtype=signal.dtype, device=signal.device)
+    else:
+        sigma_n2_t = sigma_n2.to(signal.device)
+    denom = interference + sigma_n2_t
+
+    # per-user rates: log2(1 + signal/denom)
+    rate_per_user = torch.log2(1.0 + signal / (denom + eps))   # (B, K)
+
+    # sum over users
+    rate = rate_per_user.sum(dim=-1)   # (B,)
 
     return rate.squeeze(0) if single else rate
 
@@ -482,55 +493,108 @@ def svd_initialization_torch(H, N, M, K, P_BS, device):
 
 
 # PGA Algorithm - PyTorch Version
-def run_pga_torch(H, A0, D0, J, I_max, mu, lambda_, omega, sigma_n2, Psi, P_BS, device):
-    """
-    Run PGA algorithm using PyTorch tensors.
-    All inputs should be PyTorch tensors on the specified device.
-    Returns the convergence history of R - omega * tau at each iteration.
-    """
-    N, K = H.shape[1], H.shape[0]
-    A = A0.clone()
-    D = D0.clone()
-    
-    eta = 1.0 / N  # Balancing term
-    
-    # Track objective value at each iteration
-    objective_history = np.zeros(I_max)
+def run_pga_torch_batch(H, A0, D0, J, I_max, mu, lambda_, omega, sigma_n2, Psi, P_BS, device=None):
+    # infer device
+    if device is None:
+        device = H.device if isinstance(H, torch.Tensor) else torch.device("cpu")
 
+    # convert single-sample inputs to batch dimension
+    single = False
+    if H.dim() == 2:
+        single = True
+        H = H.unsqueeze(0)       # (1, K, N)
+        A0 = A0.unsqueeze(0)     # (1, N, M)
+        D0 = D0.unsqueeze(0)     # (1, M, K)
+        if Psi.dim() == 2:
+            Psi = Psi.unsqueeze(0)
+        if isinstance(P_BS, (float, int, torch.Tensor)):
+            P_BS = torch.tensor(P_BS, device=device, dtype=torch.float32).view(1)
+
+    # ensure tensors on device
+    H = H.to(device)
+    A = A0.clone().to(device)
+    D = D0.clone().to(device)
+    Psi = Psi.to(device)
+    if not torch.is_tensor(P_BS):
+        P_BS = torch.tensor(P_BS, dtype=torch.float32, device=device)
+    P_BS = P_BS.to(device)
+
+    B = H.shape[0]          # batch size
+    N = A.shape[1]          # number of TX antennas (N)
+    # M = A.shape[2], K = D.shape[2]
+
+    # Print the shapes for debugging
+    # print(f"H shape: {H.shape}, A shape: {A.shape}, D shape: {D.shape}, Psi shape: {Psi.shape}, P_BS shape: {P_BS.shape}")
+
+    # Ensure P_BS shape: (B,)
+    if P_BS.dim() == 0:
+        P_BS = P_BS.repeat(B)
+    elif P_BS.shape[0] != B:
+        P_BS = P_BS.view(-1).repeat(B)[:B]
+
+    # prepare storage for objective history (per-sample)
+    objective_history_batch = torch.zeros((I_max, B), dtype=torch.float32, device=device)
+
+    # balancing term (same as single-sample code)
+    eta = 1.0 / float(N)
+
+    eps = 1e-12
+    
+
+    # main outer loop (vectorized across batch)
     for i in range(I_max):
-        # ---- Inner Loop: Analog Precoder Update ----
+        # ---- Inner Loop: Analog update (batched) ----
         A_hat = A.clone()
-        
         for j in range(J):
-            grad_R_A = gradient_R_A_torch(H, A_hat, D, sigma_n2)
-            grad_tau_A = gradient_tau_A_torch(A_hat, D, Psi)
+            # gradient functions support batched inputs
+            grad_R_A = gradient_R_A_torch(H, A_hat, D, sigma_n2)       # (B, N, M), complex
+            grad_tau_A = gradient_tau_A_torch(A_hat, D, Psi)           # (B, N, M), complex
 
-            # Eq. (14b): Gradient Ascent on A
-            grad_A = grad_R_A - omega * grad_tau_A
+            grad_A = grad_R_A - (omega * grad_tau_A)
+            # step & unit-modulus projection
             A_hat = A_hat + mu * grad_A
-
-            # Eq. (7): Unit Modulus Projection
-            A_hat = torch.exp(1j * torch.angle(A_hat))
+            A_hat = torch.exp(1j * torch.angle(A_hat))   # unit modulus projection
 
         A = A_hat.clone()
 
-        # ---- Outer Loop: Digital Precoder Update ----
-        grad_R_D = gradient_R_D_torch(H, A, D, sigma_n2)
-        grad_tau_D = gradient_tau_D_torch(A, D, Psi)
+        # ---- Outer Loop: Digital update (batched) ----
+        grad_R_D = gradient_R_D_torch(H, A, D, sigma_n2)    # (B, M, K), complex
+        grad_tau_D = gradient_tau_D_torch(A, D, Psi)        # (B, M, K), complex
 
-        # Eq. (15): Gradient Ascent on D
         grad_D = grad_R_D - omega * eta * grad_tau_D
         D = D + lambda_ * grad_D
 
-        # Eq. (9): Power Constraint Projection
-        D = torch.sqrt(P_BS) * D / torch.linalg.norm(A @ D, ord='fro')
-        
-        # Compute objective value: R - omega * tau
-        R = compute_rate_torch(H, A, D, sigma_n2)
-        tau = compute_tau_torch(A, D, Psi)
-        objective_history[i] = (R - omega * tau).cpu().item()
+        # ---- Power constraint projection (per-sample) ----
+        # Compute ||A D||_F per sample
+        AD = torch.bmm(A, D)   # (B, N, K)
+        norm_AD = torch.linalg.norm(AD, ord='fro', dim=(1, 2), keepdim=True)  # (B, 1, 1)
+        # sqrt(P_BS) per sample
+        sqrt_P = torch.sqrt(P_BS).view(B, 1, 1).to(D.device)
+        D = D * (sqrt_P / (norm_AD + eps))
 
-    return objective_history, R, A, D
+        # ---- Compute objective per sample and store ----
+        R_batch = compute_rate_torch(H, A, D, sigma_n2)         # (B,)
+        tau_batch = compute_tau_torch(A, D, Psi)               # (B,)
+        objective = (R_batch - omega * tau_batch).to(device)   # (B,)
+        objective_history_batch[i, :] = objective
+
+    # prepare outputs
+    objective_history_batch_np = objective_history_batch.cpu().numpy()   # (I_max, B)
+    objective_history_avg = objective_history_batch_np.mean(axis=1)     # (I_max,)
+
+    # final R, A, D
+    R_batch_final = compute_rate_torch(H, A, D, sigma_n2)   # (B,)
+
+    # if single-sample input, squeeze batch dimension on outputs to keep original API
+    if single:
+        objective_history_avg = objective_history_avg
+        objective_history_batch_np = objective_history_batch_np[:, 0]
+        R_batch_final = R_batch_final.squeeze(0)
+        A = A.squeeze(0)
+        D = D.squeeze(0)
+
+    return objective_history_avg, objective_history_batch_np, R_batch_final, A, D
+
 
 
 # Zero-Forcing Baseline - PyTorch Version (FIXED)
