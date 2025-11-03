@@ -116,6 +116,9 @@ def gradient_R_A_torch(H, A, D, eps=1e-10, sigma_n2=1):
         denom1 = torch.trace(A @ V @ A.conj().T @ H_tilde_k) + sigma_n2 + eps
         denom2 = torch.trace(A @ V_bar_k @ A.conj().T @ H_tilde_k) + sigma_n2 + eps
 
+        denom1 = torch.real(denom1)
+        denom2 = torch.real(denom2)
+
         term1 = H_tilde_k @ A @ V / denom1
         term2 = H_tilde_k @ A @ V_bar_k / denom2
 
@@ -142,15 +145,18 @@ def gradient_R_D_torch(H, A, D, sigma_n2, eps=1e-10, clip_value=1e3):
         denom1 = torch.trace(D @ D.conj().T @ H_bar_k) + sigma_n2 + eps
         denom2 = torch.trace(D_bar_k @ D_bar_k.conj().T @ H_bar_k) + sigma_n2 + eps
 
+        denom1 = torch.real(denom1)
+        denom2 = torch.real(denom2)
+
         term1 = (H_bar_k @ D) / denom1
         term2 = (H_bar_k @ D_bar_k) / denom2
 
         grad_D += xi * (term1 - term2)
 
-    # Clip gradients to prevent explosion
-    grad_norm = torch.linalg.norm(grad_D, ord='fro')
-    if grad_norm > clip_value:
-        grad_D = grad_D * (clip_value / grad_norm)
+    # # Clip gradients to prevent explosion
+    # grad_norm = torch.linalg.norm(grad_D, ord='fro')
+    # if grad_norm > clip_value:
+    #     grad_D = grad_D * (clip_value / grad_norm)
     
     # # Check for NaN/Inf
     # if torch.isnan(grad_D).any() or torch.isinf(grad_D).any():
@@ -161,26 +167,51 @@ def gradient_R_D_torch(H, A, D, sigma_n2, eps=1e-10, clip_value=1e3):
 def gradient_tau_A_torch(A, D, Psi, eps=1e-10):
     U = A @ D @ D.conj().T @ A.conj().T
     grad_A = 2 * (U - Psi) @ A @ D @ D.conj().T
-    grad_A = grad_A / (torch.linalg.norm(grad_A, ord='fro') + eps)
+    grad_A = torch.exp(1j * torch.angle(grad_A))
     return grad_A
 
 
-def gradient_tau_D_torch(A, D, Psi, eps=1e-10):
+def gradient_tau_D_torch(A, D, Psi, P_BS, eps=1e-10):
     U = A @ D @ D.conj().T @ A.conj().T
     grad_D = 2 * A.conj().T @ (U - Psi) @ A @ D
-    grad_D = grad_D / (torch.linalg.norm(grad_D, ord='fro') + eps)
+    # grad_D = (grad_D * torch.sqrt(P_BS))/ (torch.linalg.norm(grad_D, ord='fro') + eps)
     return grad_D
 
 
 
 def proposed_initialization_torch(H, theta_d, N, M, K, P_BS, device):
-    """Proposed initialization using PyTorch"""
-    G = H.T  # since M=K
-    A0 = torch.exp(-1j * torch.angle(G))[:, :M]
-    X_ZF = torch.linalg.pinv(H)
-    D0 = torch.linalg.pinv(A0) @ X_ZF
-    D0 = torch.sqrt(P_BS) * D0 / torch.linalg.norm(A0 @ D0, ord='fro')
+    """
+    Proposed initialization (single-sample).
+    H: (K, N) complex
+    Returns:
+      A0: (N, M) complex (unit-modulus)
+      D0: (M, K) complex
+    """
+    # ensure correct device and dtype
+    H = H.to(device)
+    eps = 1e-12
+
+    # G = H^T has shape (N, K)
+    G = H.transpose(0, 1)  # or H.T
+
+    # build A0 from phase of G, and select first M columns
+    # If K < M you may need to pad (but usually M <= K)
+    A0_full = torch.exp(-1j * torch.angle(G))        # (N, K)
+    A0 = A0_full[:, :M].clone()                      # (N, M)
+
+    # compute ZF target X_ZF = H^† (pseudo-inverse)
+    X_ZF = torch.linalg.pinv(H)                      # (N, K) since H is (K, N)
+
+    # D0 = pinv(A0) @ X_ZF
+    A0_pinv = torch.linalg.pinv(A0)                  # (M, N)
+    D0 = A0_pinv @ X_ZF                              # (M, K)
+
+    # normalize to satisfy ||A0 D0||_F^2 = P_BS
+    norm_AD = torch.linalg.norm(A0 @ D0, ord='fro')  # real scalar
+    D0 = torch.sqrt(torch.tensor(P_BS, dtype=norm_AD.dtype, device=device)) * D0 / (norm_AD + eps)
+
     return A0, D0
+
 
 def proposed_initialization_torch_batch(H, theta_d, N, M, K, P_BS, device):
     """
@@ -205,9 +236,10 @@ def proposed_initialization_torch_batch(H, theta_d, N, M, K, P_BS, device):
     A0_pinv = torch.linalg.pinv(A0)  # shape: (batch_size, M, N)
     D0 = torch.bmm(A0_pinv, X_ZF)  # shape: (batch_size, M, M)
     
+    eps = 1e-12
     # Normalize
     norm_factor = torch.linalg.norm(torch.bmm(A0, D0), ord='fro', dim=(1, 2), keepdim=True)
-    D0 = torch.sqrt(P_BS) * D0 / norm_factor
+    D0 = torch.sqrt(P_BS) * D0 / (norm_factor + eps)
 
     return A0, D0
 
@@ -316,21 +348,23 @@ def run_pga_torch(H, A0, D0, J, I_max, mu, lambda_, omega, sigma_n2, Psi, P_BS, 
 
         # ---- Outer Loop: Digital Precoder Update ----
         grad_R_D = gradient_R_D_torch(H, A, D, sigma_n2)
-        grad_tau_D = gradient_tau_D_torch(A, D, Psi)
+        grad_tau_D = gradient_tau_D_torch(A, D, Psi, P_BS)
 
         # Eq. (15): Gradient Ascent on D
         grad_D = grad_R_D - omega * eta * grad_tau_D
         D = D + lambda_ * grad_D
 
         # Eq. (9): Power Constraint Projection
-        D = torch.sqrt(P_BS) * D / torch.linalg.norm(A @ D, ord='fro')
+        eps = 1e-12
+        norm_AD = torch.linalg.norm(A @ D, ord='fro')
+        D = torch.sqrt(P_BS) * D / (norm_AD + eps)
         
         # Compute objective value: R - omega * tau
         R = compute_rate_torch(H, A, D, sigma_n2)
         tau = compute_tau_torch(A, D, Psi)
         objective_history[i] = (R - omega * tau).cpu().item()
 
-    return objective_history, R, A, D
+    return objective_history, A, D
 
 
 # Zero-Forcing Baseline - PyTorch Version (FIXED)
