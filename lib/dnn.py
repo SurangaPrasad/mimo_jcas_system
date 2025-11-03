@@ -5,28 +5,30 @@ from .support_functions_torch import compute_rate_torch, compute_tau_torch, grad
 
 # Projection functions for PyTorch
 def project_unit_modulus(A):
-    """Project A onto unit modulus constraint"""
-    return A / (torch.abs(A) + 1e-8)
+    """
+    Project each entry of A onto the complex unit circle:
+    A_proj[i,j] = exp(1j * angle(A[i,j]))
+    """
+    return torch.exp(1j * torch.angle(A))
+
 
 def project_power_constraint(A, D, P_BS):
     """
-    A: (B, N, M) or (N, M) if single sample
-    D: (B, M, K) or (M, K)
-    P_BS: (B,) or scalar
-    Returns scaled D, same device/dtype.
+    Project digital precoder D such that ||A D||_F = sqrt(P_BS) using Frobenius norm.
+    Works for batched or single inputs.
     """
     if A.dim() == 2:
         # single sample
-        norm = torch.linalg.norm(A @ D, ord='fro')
-        return D * (torch.sqrt(P_BS) / (norm + 1e-8))
+        norm_AD = torch.norm(A @ D, p='fro')  # Frobenius norm ||A D||_F
+        return D * (torch.sqrt(P_BS) / (norm_AD + 1e-12))
     else:
-        # batched
-        # compute A @ D for each sample: (B, N, K)
-        AD = torch.bmm(A, D)                    # (B, N, K)
-        norms = torch.linalg.norm(AD, dim=(1,2))  # (B,)
-        scale = torch.sqrt(P_BS).view(-1).to(norms.device) / (norms + 1e-8)  # (B,)
-        scale = scale.view(-1, 1, 1)            # (B,1,1)
+        # batched case
+        AD = torch.bmm(A, D)  # (B, N, K)
+        norm_AD = torch.norm(AD, dim=(1, 2), p='fro')  # (B,)
+        scale = torch.sqrt(P_BS.view(-1).to(AD.device)) / (norm_AD + 1e-12)  # (B,)
+        scale = scale.view(-1, 1, 1)
         return D * scale
+
 
 
 class UPGANetLayer(nn.Module):
@@ -50,8 +52,8 @@ class UPGANetLayer(nn.Module):
         """
         # J inner updates for analog precoder
         A_hat = A.clone()
-        mu = torch.nn.functional.softplus(self.mu)
-        lambda_ = torch.nn.functional.softplus(self.lambda_)
+        # mu = torch.nn.functional.softplus(self.mu)
+        # lambda_ = torch.nn.functional.softplus(self.lambda_)
         
         for j in range(self.J):
             # Compute gradients - now supports batching
@@ -59,7 +61,7 @@ class UPGANetLayer(nn.Module):
             grad_tauA = gradient_tau_A_torch(A_hat, D, Psi)
 
             # Gradient ascent with learnable step size
-            A_hat = A_hat + mu[j] * (grad_RA - self.omega * grad_tauA)
+            A_hat = A_hat + self.mu[j] * (grad_RA - self.omega * grad_tauA)
 
             # Unit modulus projection
             A_hat = project_unit_modulus(A_hat)
@@ -72,7 +74,7 @@ class UPGANetLayer(nn.Module):
             grad_tauD = gradient_tau_D_torch(A, D, Psi)
 
         # Gradient ascent with learnable step size
-        D = D + lambda_ * (grad_RD - self.omega * self.eta * grad_tauD)
+        D = D + self.lambda_ * (grad_RD - self.omega * self.eta * grad_tauD)
         
         # Power constraint projection
         D = project_power_constraint(A, D, P_BS)
@@ -113,5 +115,6 @@ def upganet_loss(H, A, D, Psi, sigma_n2, omega):
     tau = compute_tau_torch(A, D, Psi)
     loss = -(R - omega * tau)
     loss = loss.mean()
+    # print("R:", R, "tau:", tau, "loss:", loss)
     return loss 
 

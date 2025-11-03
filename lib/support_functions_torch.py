@@ -153,7 +153,7 @@ def compute_tau_torch(A, D, Psi):
 
     # 4. τ = ||U - Ψ||_F² per batch
     diff = U - Psi
-    tau = torch.sum(torch.abs(diff)**2, dim=(1, 2))  # (B,)
+    tau = torch.linalg.norm(diff, ord='fro', dim=(-2, -1))**2  # (B,)
 
     return tau.squeeze(0) if single else tau
 
