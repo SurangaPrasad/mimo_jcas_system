@@ -522,10 +522,10 @@ def run_pga_torch_batch(H, A0, D0, J, I_max, mu, lambda_, omega, sigma_n2, Psi, 
                 norm_tau_A = batch_fro_norm(grad_tau_A)
                 norm_R_D = batch_fro_norm(grad_R_D)
                 norm_tau_D = batch_fro_norm(grad_tau_D)
-                print(f"iter {i:3d}: ||gR_A|| mean={norm_R_A.mean().item():.3e}, "
-                      f"||gτ_A|| mean={norm_tau_A.mean().item():.3e}, "
-                      f"||gR_D|| mean={norm_R_D.mean().item():.3e}, "
-                      f"||gτ_D|| mean={norm_tau_D.mean().item():.3e}")
+                #print(f"iter {i:3d}: ||gR_A|| mean={norm_R_A.mean().item():.3e}, "
+                 #     f"||gτ_A|| mean={norm_tau_A.mean().item():.3e}, "
+                  #    f"||gR_D|| mean={norm_R_D.mean().item():.3e}, "
+                   #   f"||gτ_D|| mean={norm_tau_D.mean().item():.3e}")
             except Exception as e:
                 print("Diagnostics error:", e)
 
