@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import h5py
 
+from .config import *
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # ---- Channel generation (single + batch) ----
@@ -594,3 +595,15 @@ def compute_R_ZF_torch(H, sigma_n2, P_BS, device=device):
     if single:
         return R_out.squeeze(0)
     return R_out
+
+def compute_psi(snr_db):
+    """
+    Selects the Psi matrix corresponding to the closest SNR value.
+    """
+    # Find index of closest SNR
+    idx = np.argmin(np.abs(SNR_dB_array - snr_db))
+
+    # Select corresponding Psi
+    Psi = Psi_all[idx, :, :]
+
+    return Psi
