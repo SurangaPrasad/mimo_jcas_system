@@ -330,7 +330,7 @@ def run_pga_torch(H, A0, D0, J, I_max, mu, lambda_, omega, sigma_n2, Psi, P_BS, 
         tau = compute_tau_torch(A, D, Psi)
         objective_history[i] = (R - omega * tau).cpu().item()
 
-    return objective_history, R, A, D
+    return objective_history,R, A, D
 
 
 # Zero-Forcing Baseline - PyTorch Version (FIXED)
